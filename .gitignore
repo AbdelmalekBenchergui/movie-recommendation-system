@@ -1,0 +1,37 @@
+# Terraform (state + local config, must never be committed)
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/*.tfplan
+terraform/.terraform.lock.hcl
+**/.terraform/
+*.tfplan
+terraform/*.tfvars
+terraform/*.tfvars.json
+
+# AWS / secrets
+.aws/
+.env
+.env.*
+
+# Local data (large dataset, not for version control)
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
