@@ -12,9 +12,14 @@ terraform/*.tfvars.json
 .aws/
 .env
 .env.*
+!.env.example
 
 # Local data (large dataset, not for version control)
 data/
+
+# Local build artifacts
+.build/
+*.zip
 
 # IDE
 .vscode/
@@ -29,6 +34,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+docs/
 
 # Jupyter
 .ipynb_checkpoints/

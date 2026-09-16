@@ -32,3 +32,13 @@ output "glue_role_arn" {
   description = "Glue service role ARN"
   value       = aws_iam_role.glue_service_role.arn
 }
+
+output "sagemaker_role_arn" {
+  description = "SageMaker execution role ARN"
+  value       = aws_iam_role.sagemaker_execution.arn
+}
+
+output "api_url" {
+  description = "Recommendations API endpoint"
+  value       = "${aws_apigatewayv2_api.ml.api_endpoint}/prod"
+}

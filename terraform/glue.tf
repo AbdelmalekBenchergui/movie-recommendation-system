@@ -1,6 +1,5 @@
 locals {
   glue_db_name = "${var.project}_${var.env}_db"
-  catalog_id   = data.aws_caller_identity.current.account_id
 }
 
 data "aws_caller_identity" "current" {}
@@ -22,6 +21,46 @@ resource "aws_glue_catalog_table" "raw_ratings" {
 
   storage_descriptor {
     location      = "s3://${aws_s3_bucket.data_lake.bucket}/raw/ratings/"
+    input_format  = "org.apache.hadoop.mapred.TextInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+    ser_de_info {
+      serialization_library = "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+      parameters = {
+        "field.delim"          = ";"
+        "serialization.format" = ";"
+      }
+    }
+    columns {
+      name = "user_id"
+      type = "bigint"
+    }
+    columns {
+      name = "movie_id"
+      type = "bigint"
+    }
+    columns {
+      name = "rating"
+      type = "double"
+    }
+    columns {
+      name = "timestamp"
+      type = "bigint"
+    }
+  }
+}
+
+resource "aws_glue_catalog_table" "raw_streaming_ratings" {
+  name          = "raw_streaming_ratings"
+  database_name = aws_glue_catalog_database.data_lake.name
+  table_type    = "EXTERNAL_TABLE"
+
+  parameters = {
+    EXTERNAL       = "TRUE"
+    classification = "csv"
+  }
+
+  storage_descriptor {
+    location      = "s3://${aws_s3_bucket.data_lake.bucket}/raw/streaming/ratings/"
     input_format  = "org.apache.hadoop.mapred.TextInputFormat"
     output_format = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
     ser_de_info {
@@ -136,8 +175,14 @@ resource "aws_glue_catalog_table" "processed_ratings_fact" {
   table_type    = "EXTERNAL_TABLE"
 
   parameters = {
-    EXTERNAL       = "TRUE"
-    classification = "parquet"
+    EXTERNAL                               = "TRUE"
+    classification                         = "parquet"
+    "projection.enabled"                   = "true"
+    "projection.rating_date.type"          = "date"
+    "projection.rating_date.range"         = "2000-01-01,NOW"
+    "projection.rating_date.format"        = "yyyy-MM-dd"
+    "projection.rating_date.interval"      = "1"
+    "projection.rating_date.interval.unit" = "DAYS"
   }
 
   storage_descriptor {

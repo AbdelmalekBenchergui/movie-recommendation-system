@@ -15,3 +15,9 @@ variable "project" {
   type        = string
   default     = "recsys"
 }
+
+variable "model_prefix" {
+  description = "S3 prefix (under ML_BUCKET) pointing at the deployed serving bundle"
+  type        = string
+  default     = "ml/models/20260908-014740"
+}
