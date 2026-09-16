@@ -1,0 +1,200 @@
+{
+  "Comment": "recsys retrain pipeline: Glue ETL -> prepare (Athena UNLOAD) -> SageMaker Training -> Processing publish -> Lambda deploy -> verify",
+  "StartAt": "RunEtl",
+  "States": {
+    "RunEtl": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${etl_job_name}"
+      },
+      "ResultPath": "$.etlResult",
+      "Next": "PrepareData"
+    },
+    "PrepareData": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "ResultPath": "$",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${prepare_lambda_arn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Train"
+    },
+    "Train": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+      "ResultPath": "$.trainResult",
+      "Parameters": {
+        "TrainingJobName.$": "States.Format('recsys-retrain-{}', $.run)",
+        "RoleArn": "${sagemaker_role_arn}",
+        "AlgorithmSpecification": {
+          "TrainingImage": "${training_image}",
+          "TrainingInputMode": "File"
+        },
+        "HyperParameters": {
+          "sagemaker_program": "two_tower_train.py",
+          "sagemaker_submit_directory": "${code_s3}/two_tower_train.tar.gz",
+          "sagemaker_container_log_level": "20",
+          "sagemaker_region": "us-east-1",
+          "data-root": "/opt/ml/input/data/training",
+          "out-root": "/opt/ml/model",
+          "run": ".",
+          "epochs.$": "States.Format('{}', $.epochs)",
+          "batch-size": "1024",
+          "lr": "1e-3",
+          "wd": "1e-4",
+          "dim": "64",
+          "content-dim": "24",
+          "out-dim": "64",
+          "dropout": "0.2",
+          "tau-fixed": "0.5",
+          "score-mode": "cosine",
+          "patience": "4",
+          "lr-patience": "3",
+          "val-fraction": "0.2",
+          "seed": "42",
+          "device": "cpu"
+        },
+        "InputDataConfig": [
+          {
+            "ChannelName": "training",
+            "DataSource": {
+              "S3DataSource": {
+                "S3DataType": "S3Prefix",
+                "S3Uri.$": "$.input_s3",
+                "S3DataDistributionType": "FullyReplicated"
+              }
+            },
+            "InputMode": "File"
+          }
+        ],
+        "OutputDataConfig": {
+          "S3OutputPath": "${output_path}"
+        },
+        "ResourceConfig": {
+          "InstanceCount": 1,
+          "InstanceType.$": "$.instance_type",
+          "VolumeSizeInGB": 30
+        },
+        "StoppingCondition": {
+          "MaxRuntimeInSeconds": 3600
+        }
+      },
+      "Next": "Publish"
+    },
+    "Publish": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+      "ResultPath": "$.pubResult",
+      "Parameters": {
+"ProcessingJobName.$": "States.Format('recsys-pub-{}', $.run)",
+        "RoleArn": "${sagemaker_role_arn}",
+        "Environment": {
+          "RUN.$": "$.run"
+        },
+        "AppSpecification": {
+          "ImageUri": "${training_image}",
+          "ContainerEntrypoint": ["python"],
+          "ContainerArguments": [
+            "/opt/ml/processing/input/code/scripts/sage/processing_publish.py",
+            "--model-tar", "/opt/ml/processing/input/model/model.tar.gz",
+            "--data-root", "/opt/ml/processing/input/data",
+            "--bucket", "${bucket}"
+          ]
+        },
+        "ProcessingResources": {
+          "ClusterConfig": {
+            "InstanceCount": 1,
+            "InstanceType": "ml.m5.large",
+            "VolumeSizeInGB": 30
+          }
+        },
+        "StoppingCondition": {
+          "MaxRuntimeInSeconds": 1800
+        },
+        "ProcessingInputs": [
+          {
+            "InputName": "model",
+            "AppManaged": false,
+            "S3Input": {
+              "S3DataType": "S3Prefix",
+              "S3Uri.$": "States.Format('${output_path}/recsys-retrain-{}/output/', $.run)",
+              "LocalPath": "/opt/ml/processing/input/model",
+              "S3InputMode": "File"
+            }
+          },
+          {
+            "InputName": "data",
+            "AppManaged": false,
+            "S3Input": {
+              "S3DataType": "S3Prefix",
+              "S3Uri.$": "$.input_s3",
+              "LocalPath": "/opt/ml/processing/input/data",
+              "S3InputMode": "File"
+            }
+          },
+          {
+            "InputName": "code",
+            "AppManaged": false,
+            "S3Input": {
+              "S3DataType": "S3Prefix",
+              "S3Uri": "${code_s3}",
+              "LocalPath": "/opt/ml/processing/input/code",
+              "S3InputMode": "File"
+            }
+          }
+        ]
+      },
+      "Next": "Deploy"
+    },
+    "Deploy": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "ResultPath": "$.deployResult",
+      "Parameters": {
+        "FunctionName": "${deploy_lambda_arn}",
+        "Payload": {
+          "run.$": "$.run"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "Verify"
+    },
+    "Verify": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${verify_lambda_arn}",
+        "Payload": {
+          "run.$": "$.run"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "End": true
+    }
+  }
+}
