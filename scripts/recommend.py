@@ -27,6 +27,10 @@ class Bundle:
         self.item_meta = STATE["item_meta"]
         self.popularity = STATE.get("popularity", [])
         self.movie_idx = {m["movie_id"]: i for i, m in enumerate(self.item_meta)}
+        self.history = STATE.get("history")
+        self.user_disliked = STATE.get("user_disliked") or {}
+        a = cfg.get("fusion_alpha")
+        self.fusion_alpha = float(a) if a is not None else None
 
     def popular_items(self, k):
         out = []
@@ -55,6 +59,8 @@ class Bundle:
             w["occ.weight"][[int(self.feat["occ"][uidx])]],
         ], axis=1)
         x = np.concatenate([id_part, c], axis=1)
+        if self.history is not None:
+            x = np.concatenate([x, self.history[uidx][None, :]], axis=1)
         x = x @ w["u_mlp.0.weight"].T + w["u_mlp.0.bias"]
         x = np.maximum(x, 0.0)
         x = x @ w["u_mlp.3.weight"].T + w["u_mlp.3.bias"]
@@ -86,6 +92,11 @@ def _load_bundle_s3(bucket, prefix):
         with open(path, "wb") as f:
             f.write(obj["Body"].read())
     STATE["config"] = json.loads(_load_file("/tmp/srv_config.json"))
+    if STATE["config"].get("history_dim", 0) > 0 and STATE["config"].get("fusion_alpha") is not None:
+        for k in ["user_history.npy", "user_disliked.json"]:
+            obj = client.get_object(Bucket=bucket, Key=f"{prefix}/serving/{k}")
+            with open(f"/tmp/srv_{k}", "wb") as f:
+                f.write(obj["Body"].read())
     STATE["weights"] = np.load("/tmp/srv_weights.npz")
     STATE["embeddings"] = np.load("/tmp/srv_item_embeddings.npy")
     STATE["item_raw"] = np.load("/tmp/srv_item_vectors_raw.npy")
@@ -97,6 +108,14 @@ def _load_bundle_s3(bucket, prefix):
         STATE["popularity"] = json.loads(_load_file("/tmp/srv_popularity_top.json"))
     except Exception:
         STATE["popularity"] = []
+    try:
+        STATE["history"] = np.load("/tmp/srv_user_history.npy") if os.path.exists("/tmp/srv_user_history.npy") else None
+    except Exception:
+        STATE["history"] = None
+    try:
+        STATE["user_disliked"] = json.loads(_load_file("/tmp/srv_user_disliked.json"))
+    except Exception:
+        STATE["user_disliked"] = {}
 
 
 def recommend_for_user(bundle, user_id, k=10, exclude=None):
@@ -113,27 +132,48 @@ def recommend_for_user(bundle, user_id, k=10, exclude=None):
         x = x.strip()
         if x and x.isdigit() and int(x) in bundle.movie_idx:
             excl.add(bundle.movie_idx[int(x)])
+    dislike_set = set(bundle.user_disliked.get(str(uidx), []))
 
     n = bundle.n_movies
-    pool = min(n, k + 2 * len(excl) + 32)
+    pool = min(n, k + 2 * len(excl) + 2 * len(dislike_set) + 32)
     scores, cand = bundle.index.search(np.ascontiguousarray(u_norm[None, :]), pool)
     scores = scores[0].astype(np.float64)
     cand = cand[0]
+    valid = [(i, int(idx)) for i, idx in enumerate(cand) if idx >= 0 and idx not in excl and idx not in dislike_set]
+
+    fused = bundle.fusion_alpha is not None
+    sim = {i: float(scores[i]) for i, _ in valid}
+    sim_norm = None
+    if fused and valid:
+        vals = [sim[i] for i, _ in valid]
+        lo, hi = min(vals), max(vals)
+        sim_norm = {i: (v - lo) / (hi - lo) if hi > lo else 0.5 for i, v in sim.items()}
+    elif fused:
+        sim_norm = {}
+
+    rows = []
+    for i, idx in valid:
+        meta = bundle.item_meta[idx]
+        pred = round(bundle.predict_rating(uvec_raw, idx), 2)
+        if fused:
+            rating_norm = (pred - 1.0) / 4.0
+            score = bundle.fusion_alpha * sim_norm[i] + (1.0 - bundle.fusion_alpha) * rating_norm
+        else:
+            score = sim[i]
+        rows.append((score, meta, sim[i], pred))
+    if fused:
+        rows.sort(key=lambda r: r[0], reverse=True)
 
     out = []
-    for i, idx in enumerate(cand):
-        if idx < 0 or idx in excl:
-            continue
-        meta = bundle.item_meta[int(idx)]
+    for score, meta, cos, pred in rows[:k]:
         out.append({
             "movie_id": meta["movie_id"],
             "title": meta["title"],
             "genres": meta["genres"],
-            "score": round(float(scores[i]), 6),
-            "predicted_rating": round(bundle.predict_rating(uvec_raw, int(idx)), 2),
+            "score": round(float(score), 6),
+            "cosine_score": round(float(cos), 6),
+            "predicted_rating": pred,
         })
-        if len(out) >= k:
-            break
     return out
 
 

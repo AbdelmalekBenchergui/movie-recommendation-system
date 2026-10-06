@@ -6,6 +6,7 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.context import SparkContext
 from pyspark.sql import functions as F
+from pyspark.sql import Window
 
 args = getResolvedOptions(
     sys.argv,
@@ -25,6 +26,11 @@ df_ratings = (
     glueContext.create_dynamic_frame
     .from_catalog(database=DB, table_name="raw_ratings")
     .toDF()
+    .union(
+        glueContext.create_dynamic_frame
+        .from_catalog(database=DB, table_name="raw_streaming_ratings")
+        .toDF()
+    )
 )
 
 df_movies = (
@@ -41,7 +47,9 @@ df_users = (
 
 df_ratings = (
     df_ratings
-    .dropDuplicates(["user_id", "movie_id"])
+    .withColumn("_rn", F.row_number().over(Window.partitionBy("user_id", "movie_id").orderBy(F.col("timestamp").desc())))
+    .filter(F.col("_rn") == 1)
+    .drop("_rn")
     .filter(F.col("rating").isNotNull())
     .withColumn("rating_date", F.to_timestamp(F.col("timestamp")).cast("date"))
 )

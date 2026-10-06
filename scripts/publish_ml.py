@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import datetime
-import glob
 import json
 import os
 import shutil
@@ -46,7 +45,7 @@ def numpy_item_vecs(weights, genre_mat, n_movies):
     return x
 
 
-def numpy_user_vecs(weights, uidx, feat_idx):
+def numpy_user_vecs(weights, uidx, feat_idx, hist=None):
     id_part = as_np(weights["u_id.weight"])[uidx]
     c = np.concatenate([
         as_np(weights["gender.weight"])[feat_idx[:, 0]],
@@ -54,6 +53,8 @@ def numpy_user_vecs(weights, uidx, feat_idx):
         as_np(weights["occ.weight"])[feat_idx[:, 2]],
     ], axis=1)
     x = np.concatenate([id_part, c], axis=1)
+    if hist is not None:
+        x = np.concatenate([x, hist], axis=1)
     x = x @ as_np(weights["u_mlp.0.weight"].T) + as_np(weights["u_mlp.0.bias"])
     x = relu(x)
     x = x @ as_np(weights["u_mlp.3.weight"].T) + as_np(weights["u_mlp.3.bias"])
@@ -73,25 +74,113 @@ def l2norm(mat):
     return mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
 
 
-def torch_ref(sd, meta, genre_mat, user_feat, n_check=128):
+def build_user_history(item_vec_raw, u_tr, i_tr, r_tr, n_users, history_dim):
+    """Replicate training-time history: signed rating weights, mean-normalized."""
+    hw = np.clip((r_tr - T.SIGN_HALF) / 2.0, -1.0, 1.0).astype(np.float32)
+    S = np.zeros((n_users, history_dim), dtype=np.float32)
+    W = np.zeros(n_users, dtype=np.float32)
+    np.add.at(S, u_tr, hw[:, None] * item_vec_raw[i_tr])
+    np.add.at(W, u_tr, np.abs(hw))
+    hist = S / np.maximum(W, 1.0)[:, None]
+    hist[W <= 0.0] = 0.0
+    return hist
+
+
+def rebuild_split(df, model_dir):
+    """Reproduce the training 80/20 split from the checkpoint's saved hyperparams."""
+    metrics = json.load(open(os.path.join(model_dir, "metrics.json")))
+    hp = metrics.get("hyperparams", {})
+    val_fraction = float(hp.get("val_fraction", 0.2))
+    seed = int(hp.get("seed", 42))
+    df = df.sort_values("user_id").reset_index(drop=True)
+    train_idx, val_idx = T.split_by_user(df, val_fraction, seed)
+    assert len(train_idx) == int(metrics.get("n_train", -1)), \
+        f"rebuilt train split {len(train_idx)} != metrics n_train {metrics.get('n_train')}"
+    assert len(val_idx) == int(metrics.get("n_val", -1)), \
+        f"rebuilt val split {len(val_idx)} != metrics n_val {metrics.get('n_val')}"
+    return train_idx, val_idx, metrics
+
+
+def torch_ref(sd, meta, genre_mat, user_feat, hist, weights_shape):
     dev = "cpu"
+    dim, content_dim, out_dim, history_dim = weights_shape
     model = T.TwoTower(
         meta["n_users"], meta["n_movies"], meta["n_genres"], meta["n_ages"], meta["n_occs"],
-        64, 24, 64, 0.2, 0.5, "cosine", 0.5,
+        dim, content_dim, out_dim, 0.2, 0.5, "cosine", 0.5, history_dim, 0.0, True,
     ).to(dev)
     model.load_state_dict(sd)
     model.eval()
     gm_t = torch.from_numpy(genre_mat)
     with torch.no_grad():
         iv = model.item_vec(torch.arange(meta["n_movies"]), gm_t.to(dev)).numpy()
-    items = np.random.RandomState(0).choice(meta["n_movies"], size=n_check, replace=False)
-    users = np.random.RandomState(1).choice(meta["n_users"], size=n_check, replace=False)
+    items = np.random.RandomState(0).choice(meta["n_movies"], size=128, replace=False)
+    users = np.random.RandomState(1).choice(meta["n_users"], size=128, replace=False)
+    feat_t = {k: torch.as_tensor(v) for k, v in user_feat.items()}
     with torch.no_grad():
         u_raw_ref = model.user_vec(
             torch.from_numpy(users),
-            user_feat["gender"][users], user_feat["age"][users], user_feat["occ"][users],
+            feat_t["gender"][users], feat_t["age"][users], feat_t["occ"][users],
+            torch.from_numpy(hist[users]),
         ).numpy()
     return iv, u_raw_ref, items, users
+
+
+def fusion_grid(weights, item_vec_raw, item_emb, meta, user_feat, hist,
+                u_all, i_all, r_all, train_idx, val_idx, k=10, pool=64,
+                alphas=(0.0, 0.25, 0.5, 0.75, 1.0)):
+    """Ranking under hybrid reranking, emulating serving (top-pool by cosine, min-max norm)."""
+    feat_idx = np.stack([
+        user_feat["gender"].numpy(), user_feat["age"].numpy(), user_feat["occ"].numpy(),
+    ], axis=1).astype(np.int64)
+    n_items = meta["n_movies"]
+    item_norm = l2norm(item_vec_raw)
+    item_raw = as_np(item_vec_raw)
+
+    train_pos = {}
+    for idx in train_idx:
+        train_pos.setdefault(u_all[idx], set()).add(int(i_all[idx]))
+    val_pos = {}
+    for idx in val_idx:
+        val_pos.setdefault(u_all[idx], set()).add(int(i_all[idx]))
+    val_users = sorted(u for u in val_pos if len(val_pos[u]) > 0)
+
+    results = {}
+    for user in val_users:
+        mask = np.ones(n_items, dtype=bool)
+        mask[list(train_pos.get(user, ()))] = False
+        uvec = numpy_user_vecs(weights, np.array([user]), feat_idx[[user]], hist[user][None, :])
+        u_norm = uvec / (np.linalg.norm(uvec) + 1e-9)
+        sim = (u_norm @ item_norm.T)[0]                       # [n_items]
+        sim_masked = np.where(mask, sim, -1e9)
+        order = np.argsort(-sim_masked)[:pool]                # serving-style candidate pool
+        cand = order[mask[order]]
+        if len(cand) == 0:
+            continue
+        pool_sim = sim[cand]
+        lo, hi = float(pool_sim.min()), float(pool_sim.max())
+        sim_norm = (pool_sim - lo) / (hi - lo) if hi > lo else np.full(len(cand), 0.5)
+        r_raw = np.repeat(uvec, len(cand), axis=0)
+        pred = numpy_rating_head(weights, r_raw, item_raw[cand])[:, 0]
+        rating_norm = (pred - 1.0) / 4.0
+        pos_set = val_pos[user]
+        for alpha in alphas:
+            fused = alpha * sim_norm + (1.0 - alpha) * rating_norm
+            order_f = np.argsort(-fused)[:k]
+            ranks = {int(cand[t]): t + 1 for t in order_f if int(cand[t]) in pos_set}
+            dcg = sum(1.0 / np.log2(rpos + 1) for rpos in ranks.values())
+            idcg = sum(1.0 / np.log2(t + 1) for t in range(1, min(k, len(pos_set)) + 1))
+            ndcg_user = dcg / idcg if idcg > 0 else 0.0
+            hit_user = 1.0 if ranks else 0.0
+            results.setdefault(alpha, {"ndcg@10": 0.0, "hit@10": 0.0, "n": 0})
+            results[alpha]["ndcg@10"] += ndcg_user
+            results[alpha]["hit@10"] += hit_user
+            results[alpha]["n"] += 1
+    out = {}
+    for alpha, acc in results.items():
+        n = max(acc["n"], 1)
+        out[str(alpha)] = {"ndcg@10": round(acc["ndcg@10"] / n, 4),
+                           "hit@10": round(acc["hit@10"] / n, 4), "n_users": acc["n"]}
+    return out
 
 
 def build_hnsw(vectors, dim, M=32, ef_construction=100, ef_search=100):
@@ -109,7 +198,6 @@ def recall_at_100(hnsw, flat, vectors, k=100, sample=1000):
     q = vectors[:sample] if len(vectors) > sample else vectors
     _, ids_hnsw = hnsw.search(q, k)
     _, ids_flat = flat.search(q, k)
-    ids_flat_set = {tuple(sorted(row)) for row in ids_flat}
     inter = sum(len(set(a) & set(b)) for a, b in zip(ids_hnsw, ids_flat))
     return inter / (len(q) * k)
 
@@ -125,6 +213,8 @@ def main():
     parser.add_argument("--region", default=AWS_REGION)
     parser.add_argument("--ef-construction", type=int, default=100)
     parser.add_argument("--ef-search", type=int, default=100)
+    parser.add_argument("--fusion-pool", type=int, default=64)
+    parser.add_argument("--fusion-alphas", default="0.0,0.25,0.5,0.75,1.0")
     args = parser.parse_args()
 
     run = args.run or datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -141,28 +231,40 @@ def main():
 
     print("loading data + model ...")
     df, user_feat, genre_mat, meta = T.load_data(args.data_root)
+    df = df.sort_values("user_id").reset_index(drop=True)
     weights, sd = load_state(args.model_dir)
     metrics = json.load(open(os.path.join(args.model_dir, "metrics.json")))
+    train_idx, val_idx, _mb = rebuild_split(df, args.model_dir)
 
     n_users, n_movies = meta["n_users"], meta["n_movies"]
-    tau = 0.5
     dim = weights["u_id.weight"].shape[1]
     content_dim = weights["gender.weight"].shape[1]
+    out_dim = weights["u_mlp.3.weight"].shape[0]
+    history_dim = weights["u_mlp.0.weight"].shape[1] - (dim + 3 * content_dim)
+
+    print(f"rebuilt split: train={len(train_idx)} val={len(val_idx)} history_dim={history_dim}")
+
+    dfn = df.astype({"user_id": str, "movie_id": str})
+    u_all = dfn["user_id"].map(meta["user_idx_of_raw"]).values.astype(np.int64)
+    i_all = dfn["movie_id"].map(meta["movie_idx_of_raw"]).values.astype(np.int64)
+    r_all = dfn["rating"].values.astype(np.float32)
 
     print(f"computing item embeddings ({n_movies}x{dim}) ...")
     item_vec_raw = numpy_item_vecs(weights, genre_mat, n_movies)
     item_emb = l2norm(item_vec_raw)
 
-    print("computing user features + lookup ...")
+    print("building user history (train-only, signed rating weights) ...")
+    hist = build_user_history(item_vec_raw, u_all[train_idx], i_all[train_idx],
+                              r_all[train_idx], n_users, max(history_dim, 0))
     feat_idx = np.stack([
         user_feat["gender"].numpy(), user_feat["age"].numpy(), user_feat["occ"].numpy(),
     ], axis=1).astype(np.int64)
     user_lookup = {str(raw): int(idx) for raw, idx in meta["user_idx_of_raw"].items()}
 
     print("verifying numpy forward vs torch ...")
-    iv_ref, u_raw_ref, items, users = torch_ref(sd, meta, genre_mat, user_feat)
+    iv_ref, u_raw_ref, items, users = torch_ref(sd, meta, genre_mat, user_feat, hist, (dim, content_dim, out_dim, history_dim))
     dv = np.abs(item_vec_raw[items] - iv_ref[items]).max()
-    du = np.abs(numpy_user_vecs(weights, users, feat_idx[users]) - u_raw_ref).max()
+    du = np.abs(numpy_user_vecs(weights, users, feat_idx[users], hist[users]) - u_raw_ref).max()
     print(f"numpy vs torch max|diff|: item_vec={dv:.2e} user_vec={du:.2e}")
     assert dv < 1e-4 and du < 1e-4, "numpy forward diverges from torch"
 
@@ -180,19 +282,43 @@ def main():
         {"movie_id": int(k), "rating_count": int(v)} for k, v in df["movie_id"].value_counts().items()
     ]
 
+    print("computing hybrid fusion weights on validation ...")
+    alphas = tuple(float(a) for a in args.fusion_alphas.split(","))
+    fusion = fusion_grid(weights, item_vec_raw, item_emb, meta, user_feat, hist,
+                         u_all, i_all, r_all, train_idx, val_idx,
+                         k=10, pool=args.fusion_pool, alphas=alphas)
+    print(json.dumps(fusion, indent=2))
+    best_alpha = float(max(fusion, key=lambda a: fusion[a]["ndcg@10"]))
+
+    print("building user dislike sets (train ratings <= %d) ..." % T.NEG_MAX)
+    disliked = {}
+    for idx in train_idx:
+        if r_all[idx] <= T.NEG_MAX:
+            disliked.setdefault(int(u_all[idx]), []).append(int(i_all[idx]))
+    disliked = {str(u): sorted(set(v)) for u, v in disliked.items()}
+
     config = {
         "run": run,
         "model_source": os.path.basename(os.path.normpath(args.model_dir)),
         "score_mode": "cosine",
-        "tau": tau,
+        "tau": 0.5,
         "dim": dim,
         "content_dim": content_dim,
         "out_dim": item_vec_raw.shape[1],
+        "history_dim": int(history_dim),
         "n_users": n_users,
         "n_movies": n_movies,
         "n_genres": meta["n_genres"],
         "index_type": "hnsw-v1",
         "rating_scale": [1.0, 5.0],
+        "fusion_pool": args.fusion_pool,
+        "fusion_alpha": float(best_alpha),
+        "fusion_grid": fusion,
+        "rerank": {"sim_norm": "minmax-over-pool", "rating_norm": "(pred-1)/4",
+                   "score": "alpha*sim_norm + (1-alpha)*rating_norm"},
+        "neg_max": int(T.NEG_MAX),
+        "sign_half": float(T.SIGN_HALF),
+        "history_dim_src": "train-only signed rating-weighted mean of item vectors",
     }
     lineage = {
         "run": run,
@@ -222,11 +348,15 @@ def main():
     np.save(out / "item_embeddings.npy", item_emb)
     np.save(out / "item_vectors_raw.npy", item_vec_raw)
     np.savez(out / "user_features.npz", gender=feat_idx[:, 0], age=feat_idx[:, 1], occ=feat_idx[:, 2])
+    if history_dim > 0:
+        np.save(out / "user_history.npy", np.ascontiguousarray(hist))
     (out / "user_lookup.json").write_text(json.dumps(user_lookup))
+    (out / "user_disliked.json").write_text(json.dumps(disliked))
     (out / "item_meta.json").write_text(json.dumps(item_meta))
     (out / "popularity_top.json").write_text(json.dumps(popularity_top))
     (out / "config.json").write_text(json.dumps(config, indent=2))
     (out / "lineage.json").write_text(json.dumps(lineage, indent=2))
+    (out / "fusion_results.json").write_text(json.dumps(fusion, indent=2))
     shutil.copy(os.path.join(args.model_dir, "mappings.json"), out / "mappings.json")
     shutil.copy(os.path.join(args.model_dir, "model_best.pt"), out / "model_best.pt")
 
@@ -238,26 +368,31 @@ def main():
 
     if not args.upload:
         print(f"local only -> {out}")
-        return
+        print(json.dumps({"fusion_alpha": config["fusion_alpha"], "fusion_grid": fusion}))
 
-    print("uploading to S3 ...")
-    for local, key in [
-        (out / "model.tar.gz", f"{base}/model.tar.gz"),
-        (out / "weights.npz", f"{base}/serving/weights.npz"),
-        (out / "item_embeddings.npy", f"{base}/serving/item_embeddings.npy"),
-        (out / "item_vectors_raw.npy", f"{base}/serving/item_vectors_raw.npy"),
-        (out / "model.faiss", f"{base}/serving/model.faiss"),
-        (out / "index_exact.faiss", f"{base}/serving/index_exact.faiss"),
-        (out / "item_meta.json", f"{base}/serving/item_meta.json"),
-        (out / "popularity_top.json", f"{base}/serving/popularity_top.json"),
-        (out / "user_lookup.json", f"{base}/serving/user_lookup.json"),
-        (out / "user_features.npz", f"{base}/serving/user_features.npz"),
-        (out / "config.json", f"{base}/serving/config.json"),
-        (out / "lineage.json", f"{base}/lineage.json"),
-    ]:
-        s3.upload_file(str(local), args.bucket, key)
+    else:
+        print("uploading to S3 ...")
+        files = [
+            (out / "model.tar.gz", f"{base}/model.tar.gz"),
+            (out / "weights.npz", f"{base}/serving/weights.npz"),
+            (out / "item_embeddings.npy", f"{base}/serving/item_embeddings.npy"),
+            (out / "item_vectors_raw.npy", f"{base}/serving/item_vectors_raw.npy"),
+            (out / "model.faiss", f"{base}/serving/model.faiss"),
+            (out / "index_exact.faiss", f"{base}/serving/index_exact.faiss"),
+            (out / "item_meta.json", f"{base}/serving/item_meta.json"),
+            (out / "popularity_top.json", f"{base}/serving/popularity_top.json"),
+            (out / "user_lookup.json", f"{base}/serving/user_lookup.json"),
+            (out / "user_features.npz", f"{base}/serving/user_features.npz"),
+            (out / "config.json", f"{base}/serving/config.json"),
+            (out / "lineage.json", f"{base}/lineage.json"),
+        ]
+        if history_dim > 0:
+            files.append((out / "user_history.npy", f"{base}/serving/user_history.npy"))
+            files.append((out / "user_disliked.json", f"{base}/serving/user_disliked.json"))
+        for local, key in files:
+            s3.upload_file(str(local), args.bucket, key)
 
-    print(f"done in {time.time()-total:.1f}s -> s3://{args.bucket}/{base}/ (index={config['index_type']})")
+    print(f"done in {time.time()-total:.1f}s -> local .build/serve/{run} (index={config['index_type']}, fusion_alpha={config['fusion_alpha']})")
 
 
 if __name__ == "__main__":

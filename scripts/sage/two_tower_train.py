@@ -21,6 +21,19 @@ from torch.utils.data import DataLoader, Dataset
 SM_INPUT = "/opt/ml/input/data"
 SM_MODEL = "/opt/ml/model"
 
+# ── rating-aware configuration ─────────────────────────────────────────────
+# Ratings are graded preferences: 5 -> strong positive, 3 -> neutral, 1 -> strong negative.
+# The signed weight drives both the ranking loss and the history aggregate.
+NEG_MAX = 2          # ratings <= this get an explicit "not liked" penalty
+SIGN_HALF = 3.0      # inflection rating
+DEFAULT_HISTORY_DIM = 64
+
+
+def rating_sign_weight(r):
+    # r: float tensor/array of ratings in [1,5]
+    # 5 -> +1.0, 4 -> +0.5, 3 -> 0.0, 2 -> -0.5, 1 -> -1.0
+    return ((r - SIGN_HALF) / 2.0).clamp(-1.0, 1.0)
+
 
 def _default_data_root():
     if os.path.isdir(f"{SM_INPUT}/ratings"):
@@ -197,9 +210,13 @@ def tower_logits(u_vec, i_vec, tau, score_mode):
 
 class TwoTower(nn.Module):
     def __init__(self, n_users, n_movies, n_genres, n_ages, n_occs, dim, content_dim,
-                 out_dim, dropout, tau_init, score_mode="cosine", tau_fixed=None):
+                 out_dim, dropout, tau_init, score_mode="cosine", tau_fixed=None,
+                 history_dim=0, neg_weight=0.0, rating_aware=True):
         super().__init__()
         self.score_mode = score_mode
+        self.history_dim = history_dim
+        self.neg_weight = neg_weight
+        self.rating_aware = rating_aware
         self.u_id = nn.Embedding(n_users, dim)
         self.i_id = nn.Embedding(n_movies, dim)
         self.gender = nn.Embedding(2, content_dim)
@@ -211,7 +228,7 @@ class TwoTower(nn.Module):
         nn.init.normal_(self.i_id.weight, std=0.01)
 
         self.u_mlp = nn.Sequential(
-            nn.Linear(dim + 3 * content_dim, out_dim),
+            nn.Linear(dim + 3 * content_dim + history_dim, out_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(out_dim, out_dim),
@@ -237,28 +254,45 @@ class TwoTower(nn.Module):
     def tau(self):
         return self.log_tau.exp().clamp(min=0.05)
 
-    def user_vec(self, u, gender, age, occ):
+    def user_vec(self, u, gender, age, occ, history=None):
         content = torch.cat([self.gender(gender), self.age(age), self.occ(occ)], dim=-1)
-        return self.u_mlp(torch.cat([self.u_id(u), content], dim=-1))
+        x = torch.cat([self.u_id(u), content], dim=-1)
+        if self.history_dim > 0:
+            if history is None:
+                history = torch.zeros(len(u), self.history_dim, device=u.device)
+            x = torch.cat([x, history], dim=-1)
+        return self.u_mlp(x)
 
     def item_vec(self, i, genre_mat):
         id_part = self.i_id(i)
         content_part = (genre_mat @ self.genres.weight) / genre_mat.sum(dim=1, keepdim=True).clamp(min=1)
         return self.i_mlp(torch.cat([id_part, content_part], dim=-1))
 
-    def forward(self, u, gender, age, occ, i, genre_mat, rating):
-        u_vec = self.user_vec(u, gender, age, occ)
+    def forward(self, u, gender, age, occ, i, genre_mat, rating, history=None):
+        u_vec = self.user_vec(u, gender, age, occ, history)
         i_vec = self.item_vec(i, genre_mat)
         logits = tower_logits(u_vec, i_vec, self.tau(), self.score_mode)
         b = torch.arange(len(u), device=u.device)
-        loss_rank = nn.functional.cross_entropy(logits, b)
+        if not self.rating_aware:
+            loss_rank = nn.functional.cross_entropy(logits, b)
+            pred = 1.0 + 4.0 * torch.sigmoid(self.rating_head(torch.cat([u_vec, i_vec], dim=-1)).squeeze(-1))
+            loss_mse = nn.functional.mse_loss(pred, rating)
+            return loss_rank, loss_mse
+        # rating-aware ranking: weight each positive row by its rating magnitude
+        w_pos = rating_sign_weight(rating).clamp(min=0.0)
+        loss_rank = torch.mean(w_pos * nn.functional.cross_entropy(logits, b, reduction="none"))
+        # explicit negative term: low-rated items must score low for their own user
+        if self.neg_weight > 0:
+            neg_mask = (rating <= NEG_MAX).float()
+            loss_neg = torch.mean(neg_mask * nn.functional.softplus(logits.diag()))
+            loss_rank = loss_rank + self.neg_weight * loss_neg
         pred = 1.0 + 4.0 * torch.sigmoid(self.rating_head(torch.cat([u_vec, i_vec], dim=-1)).squeeze(-1))
         loss_mse = nn.functional.mse_loss(pred, rating)
         return loss_rank, loss_mse
 
 
 @torch.no_grad()
-def rating_metrics(model, u, i, rating, user_feat, genre_mat, device, chunk=65536):
+def rating_metrics(model, u, i, rating, user_feat, genre_mat, device, history=None, chunk=65536):
     model.eval()
     preds = []
     for s in range(0, len(u), chunk):
@@ -270,7 +304,8 @@ def rating_metrics(model, u, i, rating, user_feat, genre_mat, device, chunk=6553
         a = user_feat["age"][u[bs]].to(device)
         o = user_feat["occ"][u[bs]].to(device)
         gm = torch.from_numpy(genre_mat[i[bs]]).to(device)
-        u_vec = model.user_vec(u_ids, g, a, o)
+        history_b = history[u_ids] if history is not None else None
+        u_vec = model.user_vec(u_ids, g, a, o, history_b)
         i_vec = model.item_vec(i_ids, gm)
         rp = 1.0 + 4.0 * torch.sigmoid(model.rating_head(torch.cat([u_vec, i_vec], dim=-1)).squeeze(-1))
         preds.append(rp.to("cpu"))
@@ -282,7 +317,7 @@ def rating_metrics(model, u, i, rating, user_feat, genre_mat, device, chunk=6553
 
 @torch.no_grad()
 def ranking_metrics_full(model, user_feat, train_pos, val_pos, genre_mat, meta, device,
-                         ks=(5, 10, 20), chunk_users=256, score_mode="cosine"):
+                         ks=(5, 10, 20), chunk_users=256, score_mode="cosine", history=None):
     model.eval()
     n_items = meta["n_movies"]
     genre_mat_t = torch.from_numpy(genre_mat)
@@ -303,7 +338,8 @@ def ranking_metrics_full(model, user_feat, train_pos, val_pos, genre_mat, meta, 
         g = user_feat["gender"][u_np].to(device)
         a = user_feat["age"][u_np].to(device)
         o = user_feat["occ"][u_np].to(device)
-        u_vec = model.user_vec(u_ids, g, a, o).to("cpu")
+        history_b = history[u_ids] if history is not None else None
+        u_vec = model.user_vec(u_ids, g, a, o, history_b).to("cpu")
         scores = tower_logits(u_vec, i_vec_all, model.tau().item(), score_mode)
 
         for j, user in enumerate(chunk):
@@ -401,6 +437,14 @@ def main():
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--lr-patience", type=int, default=3)
     parser.add_argument("--score-mode", choices=["cosine", "dot"], default="cosine")
+    parser.add_argument("--history-dim", type=int, default=0,
+                        help="dim of the rating-weighted history aggregate fed to the user tower (0 = no history)")
+    parser.add_argument("--neg-weight", type=float, default=1.0,
+                        help="weight of the negative (rating<=2) BCE term in the ranking loss")
+    parser.add_argument("--history-grad", action="store_true",
+                        help="allow gradients to flow through the history aggregate into the item tower (default: detached)")
+    parser.add_argument("--no-rating-aware", action="store_true",
+                        help="replicate the original loss: plain in-batch CE, no rating weighting, no negative term")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -427,6 +471,13 @@ def main():
     for idx in val_idx:
         val_pos.setdefault(u_all[idx], set()).add(i_all[idx])
 
+    # train-only history rows used to build the user preference aggregates (no leakage)
+    hist_rows = {
+        "u": torch.from_numpy(u_all[train_idx]),
+        "i": torch.from_numpy(i_all[train_idx]),
+        "r": torch.from_numpy(r_all[train_idx].copy()),
+    }
+
     dataset = RatingDataset(u_all[train_idx], i_all[train_idx], r_all[train_idx])
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
                         num_workers=0, pin_memory=(device == "cuda"))
@@ -436,7 +487,7 @@ def main():
     model = TwoTower(
         meta["n_users"], meta["n_movies"], meta["n_genres"], meta["n_ages"], meta["n_occs"],
         args.dim, args.content_dim, args.out_dim, args.dropout, args.tau_init, args.score_mode,
-        args.tau_fixed,
+        args.tau_fixed, args.history_dim, args.neg_weight, not args.no_rating_aware,
     ).to(device)
     if args.tau_schedule != "none":
         model.log_tau.requires_grad_(False)
@@ -447,6 +498,30 @@ def main():
 
     best_ndcg10, best_state, hist, no_improve = -1.0, None, [], 0
 
+    # history state refreshed once per epoch from a frozen snapshot of the item tower
+    hist_S = hist_W = history_full = i_vec_all = None
+
+    def build_history_tables():
+        nonlocal hist_S, hist_W, history_full, i_vec_all
+        if args.history_dim <= 0:
+            history_full = None
+            return
+        genre_mat_t = torch.from_numpy(genre_mat)
+        with torch.no_grad():
+            i_vec_all = model.item_vec(torch.arange(meta["n_movies"], device=device),
+                                       genre_mat_t.to(device)).detach()
+        r_tr = hist_rows["r"].to(device)
+        hw_tr = rating_sign_weight(r_tr)                       # [ntr]
+        contrib = hw_tr[:, None] * i_vec_all[hist_rows["i"].to(device)]
+        hist_S = torch.zeros(meta["n_users"], args.history_dim, device=device)
+        hist_W = torch.zeros(meta["n_users"], device=device)
+        hist_S.index_add_(0, hist_rows["u"].to(device), contrib)
+        hist_W.index_add_(0, hist_rows["u"].to(device), hw_tr.abs())
+        hist_W.clamp_(min=1.0)
+        history_full = hist_S / hist_W[:, None]
+        history_full[hist_W <= 0.0] = 0.0
+        return
+
     for epoch in range(1, args.epochs + 1):
         if args.tau_schedule == "linear" and args.tau_end is not None:
             frac = (epoch - 1) / max(args.epochs - 1, 1)
@@ -454,6 +529,7 @@ def main():
             with torch.no_grad():
                 model.log_tau.fill_(math.log(max(tau_t, 0.05)))
         model.train()
+        build_history_tables()
         t0 = time.time()
         tot_rank, tot_mse, n_batch = 0.0, 0.0, 0
         for u_b, i_b, r_b in loader:
@@ -465,8 +541,16 @@ def main():
             a = user_feat["age"][u_np].to(device)
             o = user_feat["occ"][u_np].to(device)
             gm = torch.from_numpy(genre_mat[i_b.cpu()]).to(device)
+            if history_full is not None:
+                # leave-one-out: exclude the current row's own item from the user's aggregate
+                hw_b = rating_sign_weight(r_b)
+                hist_b = (hist_S[u_b] - hw_b[:, None] * i_vec_all[i_b]) / (hist_W[u_b] - hw_b.abs()).clamp(min=1.0)[:, None]
+                if not args.history_grad:
+                    hist_b = hist_b.detach()
+            else:
+                hist_b = None
             opt.zero_grad()
-            loss_rank, loss_mse = model(u_b, g, a, o, i_b, gm, r_b)
+            loss_rank, loss_mse = model(u_b, g, a, o, i_b, gm, r_b, history=hist_b)
             loss = loss_rank + args.reg_weight * loss_mse
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -474,8 +558,10 @@ def main():
             tot_rank += loss_rank.item()
             tot_mse += loss_mse.item()
             n_batch += 1
-        rmse_v, mae_v = rating_metrics(model, u_val, i_val, r_val, user_feat, genre_mat, device)
-        rk = ranking_metrics_full(model, user_feat, train_pos, val_pos, genre_mat, meta, device, ks=(5, 10, 20), score_mode=args.score_mode)
+        rmse_v, mae_v = rating_metrics(model, u_val, i_val, r_val, user_feat, genre_mat, device,
+                                       history=history_full)
+        rk = ranking_metrics_full(model, user_feat, train_pos, val_pos, genre_mat, meta, device,
+                                  ks=(5, 10, 20), score_mode=args.score_mode, history=history_full)
         scheduler.step(rk["ndcg@10"])
         cur_tau = float(model.tau().item())
         hist.append({
@@ -507,10 +593,11 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
+    build_history_tables()   # rebuild aggregates with the best checkpoint's item tower
 
-    rmse_tr, mae_tr = rating_metrics(model, u_all[train_idx], i_all[train_idx], r_all[train_idx], user_feat, genre_mat, device)
-    rmse_v, mae_v = rating_metrics(model, u_val, i_val, r_val, user_feat, genre_mat, device)
-    rk = ranking_metrics_full(model, user_feat, train_pos, val_pos, genre_mat, meta, device, ks=(5, 10, 20), score_mode=args.score_mode)
+    rmse_tr, mae_tr = rating_metrics(model, u_all[train_idx], i_all[train_idx], r_all[train_idx], user_feat, genre_mat, device, history=history_full)
+    rmse_v, mae_v = rating_metrics(model, u_val, i_val, r_val, user_feat, genre_mat, device, history=history_full)
+    rk = ranking_metrics_full(model, user_feat, train_pos, val_pos, genre_mat, meta, device, ks=(5, 10, 20), score_mode=args.score_mode, history=history_full)
     pop_b = popularity_baseline(train_pos, val_pos, train_counts, meta["n_movies"])
     mean_b = mean_baseline(u_all[train_idx], r_all[train_idx], u_val, r_val)
 
@@ -530,6 +617,10 @@ def main():
                       "random_hit@20": 20 / meta["n_movies"]},
         "ranking": rk,
         "history": hist,
+        "history_recipe": {"neg_max": NEG_MAX, "sign_half": SIGN_HALF,
+                           "history_dim": args.history_dim, "neg_weight": args.neg_weight,
+                           "history_grad": args.history_grad,
+                           "rating_aware": not args.no_rating_aware},
         "train_seconds": round(time.time() - t_start, 1),
     }
 
@@ -537,6 +628,7 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "metrics.json").write_text(json.dumps(results, indent=2, default=str))
     (run_dir / "history.json").write_text(json.dumps(hist, indent=2))
+    (run_dir / "history_recipe.json").write_text(json.dumps(results["history_recipe"], indent=2))
     if best_state is not None:
         torch.save(best_state, run_dir / "model_best.pt")
     (run_dir / "mappings.json").write_text(json.dumps({
